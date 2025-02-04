@@ -2,6 +2,7 @@ from flask import Flask, jsonify, request
 from flask import Flask, send_from_directory
 from flask_cors import CORS
 from flask_socketio import SocketIO
+from mangum import Mangum
 from ultralytics import YOLO
 import cv2
 import numpy as np
@@ -23,12 +24,16 @@ from datetime import datetime, timedelta
 from shapely.geometry import Point, Polygon
 from bson import ObjectId
 import smtplib
-from email.mime.text import MIMEText
+import logging
 from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.base import MIMEBase
+from email import encoders
 import boto3
 from botocore.exceptions import ClientError
 from urllib.parse import quote
 from sort import *
+import traceback
 
 
 app = Flask(__name__, static_folder='../build', static_url_path='/')
@@ -66,13 +71,124 @@ model = YOLO("yolov8n.pt")
 # Store active streams
 active_streams = {}
 
-# @app.route('/', defaults={'path': ''})
-# @app.route('/<path:path>')
-# def serve(path):
-#     if path != "" and os.path.exists(os.path.join(app.static_folder, path)):
-#         return send_from_directory(app.static_folder, path)
-#     else:
-#         return send_from_directory(app.static_folder, 'index.html')
+email_scheduler = None  # Global reference for one active scheduler
+class EmailScheduler:
+    def __init__(self, stream_id, user_email):
+        self.stream_id = stream_id
+        self.user_email = user_email
+        self.running = False
+        self.thread = None
+
+    def start(self):
+        if not self.running:
+            self.running = True
+            self.thread = threading.Thread(target=self._send_emails, daemon=True)
+            self.thread.start()
+            print(f"[EMAIL SCHEDULER] Started for stream {self.stream_id}")
+
+    def stop(self):
+        self.running = False
+        print(f"[EMAIL SCHEDULER] Stopped for stream {self.stream_id}")
+
+    def _send_emails(self):
+        while self.running:
+            try:
+                self.send_email_with_pdf()
+                for _ in range(60):  # Check every second for 1 minute
+                    if not self.running:
+                        break
+                    time.sleep(1)
+            except Exception as e:
+                print(f"[EMAIL SCHEDULER ERROR] {e}")
+                time.sleep(10)
+
+    def send_email_with_pdf(self):
+        try:
+            # Fetch stream data from MongoDB
+            stream = stream_collection.find_one({"stream_id": self.stream_id})
+            if not stream:
+                print(f"[EMAIL ERROR] No stream found for ID {self.stream_id}")
+                return
+
+            # Generate the PDF report
+            pdf_buffer = BytesIO()
+            generate_stream_report(stream, pdf_buffer)
+            pdf_buffer.seek(0)
+
+            # Prepare email
+            msg = MIMEMultipart()
+            msg['From'] = EMAIL_ADDRESS
+            msg['To'] = self.user_email
+            msg['Subject'] = "Perimeter Breach Detection Report"
+
+            body = f"""
+            Alert: Your stream {self.stream_id} is currently active.
+
+            Timestamp: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}
+
+            Attached is the latest perimeter breach detection report.
+
+            Best regards,
+            Perimeter Breach Detection System
+            """
+            msg.attach(MIMEText(body, 'plain'))
+
+            # Attach PDF
+            pdf_attachment = MIMEBase('application', 'octet-stream')
+            pdf_attachment.set_payload(pdf_buffer.read())
+            encoders.encode_base64(pdf_attachment)
+            pdf_attachment.add_header('Content-Disposition', f'attachment; filename=report_{self.stream_id}.pdf')
+            msg.attach(pdf_attachment)
+
+            # Send email
+            with smtplib.SMTP('smtp.gmail.com', 587) as server:
+                server.starttls()
+                server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
+                server.send_message(msg)
+
+            print(f"[EMAIL SENT] Report sent for stream {self.stream_id}")
+
+        except Exception as email_error:
+            print(f"[EMAIL ERROR] Failed to send email for stream {self.stream_id}: {email_error}")
+
+
+def monitor_stream():
+    global email_scheduler
+
+    while True:
+        try:
+            active_stream = stream_collection.find_one({}, {"stream_id": 1, "user_id": 1})  # Get first active stream
+
+            if active_stream:
+                stream_id = active_stream["stream_id"]
+
+                if not email_scheduler or email_scheduler.stream_id != stream_id:
+                    user = users_collection.find_one({"_id": ObjectId(active_stream["user_id"])})
+
+                    if not user:
+                        continue
+
+                    user_email = user["email"]
+
+                    # Stop previous scheduler if a new stream starts
+                    if email_scheduler:
+                        email_scheduler.stop()
+
+                    # Start a new scheduler
+                    email_scheduler = EmailScheduler(stream_id, user_email)
+                    email_scheduler.start()
+
+            else:
+                # No active streams, stop any existing scheduler
+                if email_scheduler:
+                    email_scheduler.stop()
+                    email_scheduler = None
+
+            time.sleep(5)  # Check for active streams every 5 seconds
+
+        except Exception as e:
+            print(f"[MONITOR ERROR] {e}")
+            time.sleep(5)
 
 
 s3_client = boto3.client(
@@ -137,6 +253,8 @@ def verify_token(auth_header):
         return None
     except jwt.InvalidTokenError:
         return None
+
+
 
 
 class StreamReport(FPDF):
@@ -335,7 +453,7 @@ class StreamProcessor:
             scaled_y = (y / self.container_height) * self.frame_height
             scaled_points.append([scaled_x, scaled_y])
         
-        print(f"Scaled points from {points} to {scaled_points}")
+        # print(f"Scaled points from {points} to {scaled_points}")
         return scaled_points
 
     def detect_humans(self, frame):
@@ -560,6 +678,7 @@ class StreamProcessor:
         union = box1_area + box2_area - intersection
 
         return intersection / union if union > 0 else 0
+
 
 
 def save_breach_event(self, frame, box, confidence):
@@ -960,6 +1079,8 @@ def get_user_info():
 # Stream Routes
 @app.route('/api/start-stream', methods=['POST', 'OPTIONS'])
 def start_stream():
+    global email_scheduler  # Declare global variable
+
     if request.method == "OPTIONS":
         return jsonify({"success": True}), 200
         
@@ -980,6 +1101,7 @@ def start_stream():
             
         # Get user info from database
         user = users_collection.find_one({"_id": ObjectId(payload["id"])})
+
         if not user:
             return jsonify({"error": "User not found"}), 404
             
@@ -999,7 +1121,16 @@ def start_stream():
             thread = threading.Thread(target=processor.process_stream)
             thread.daemon = True
             thread.start()
-            
+
+            print(f"[STREAM STARTED] ID: {stream_id}")
+
+            # **Start Email Scheduler for this Stream**
+            if email_scheduler:
+                email_scheduler.stop()  # Stop any existing scheduler before starting a new one
+
+            email_scheduler = EmailScheduler(stream_id, user["email"])  # Assign to global variable
+            email_scheduler.start()
+
             return jsonify({
                 "streamId": stream_id,
                 "userId": str(user["_id"]),
@@ -1013,6 +1144,7 @@ def start_stream():
     except Exception as e:
         print(f"Error in start_stream: {e}")
         return jsonify({"error": str(e)}), 500
+
 
 @app.route('/api/stop-stream/<stream_id>', methods=['POST', 'OPTIONS'])
 def stop_stream(stream_id):
@@ -1033,6 +1165,12 @@ def stop_stream(stream_id):
             if processor.user_id == payload["id"]:
                 processor.running = False
                 del active_streams[stream_id]
+                 
+                # **Stop the Email Scheduler if the stopped stream matches**
+                if email_scheduler and email_scheduler.stream_id == stream_id:
+                    email_scheduler.stop()
+                    email_scheduler = None  # Reset email scheduler reference
+                    print(f"[EMAIL SCHEDULER] Stopped for stream {stream_id}")
                 return jsonify({"message": "Stream stopped successfully"}), 200
             else:
                 return jsonify({"error": "Unauthorized to stop this stream"}), 403
@@ -1199,6 +1337,7 @@ def generate_report(stream_id):
         return jsonify({"error": "An unexpected error occurred"}), 500
 
 
+handler = Mangum(app)
 
 if __name__ == "__main__":
     try:
